@@ -83,16 +83,18 @@ class TrainState:
 
 
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
-    dataset = PuzzleDataset(PuzzleDatasetConfig(
-        seed=config.seed,
+    dataset = PuzzleDataset(
+        PuzzleDatasetConfig(
+            seed=config.seed,
 
-        dataset_path=config.data_path,
+            dataset_path=config.data_path,
 
-        rank=rank,
-        num_replicas=world_size,
+            rank=rank,
+            num_replicas=world_size,
 
-        **kwargs
+            **kwargs
     ), split=split)
+
     dataloader = DataLoader(
         dataset,
         batch_size=None,
@@ -100,9 +102,10 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
         num_workers=1,
         prefetch_factor=8,
 
-        pin_memory=True,
+        pin_memory=torch.cuda.is_available(),
         persistent_workers=True
     )
+
     return dataloader, dataset.metadata
 
 
@@ -122,11 +125,13 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
-    with torch.device("cuda"):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    with torch.device(device):
         model: nn.Module = model_cls(model_cfg)
         model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
         if "DISABLE_COMPILE" not in os.environ:
             model = torch.compile(model, dynamic=False)  # type: ignore
+
 
         # Broadcast parameters from rank 0
         if world_size > 1:
@@ -213,15 +218,23 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         return
 
     # To device
-    batch = {k: v.cuda() for k, v in batch.items()}
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    batch = {k: v.to(device) for k, v in batch.items()}
 
     # Init carry if it is None
     if train_state.carry is None:
-        with torch.device("cuda"):
+        with torch.device(device):
             train_state.carry = train_state.model.initial_carry(batch)  # type: ignore
 
     # Forward
+    print("model")
     train_state.carry, loss, metrics, _, _ = train_state.model(carry=train_state.carry, batch=batch, return_keys=[])
+    print("model")
+
+    # DEBUG
+    print(loss)
+    input("debug")
+    # DEBUG
 
     ((1 / global_batch_size) * loss).backward()
 
@@ -275,10 +288,11 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         metric_global_batch_size = [0 for _ in range(len(set_ids))]
 
         carry = None
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         for set_name, batch, global_batch_size in eval_loader:
             # To device
-            batch = {k: v.cuda() for k, v in batch.items()}
-            with torch.device("cuda"):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            with torch.device(device):
                 carry = train_state.model.initial_carry(batch)  # type: ignore
 
             # Forward
@@ -301,7 +315,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
 
             if metric_values is None:
                 metric_keys = list(sorted(metrics.keys()))  # Sort keys to guarantee all processes use the same order.
-                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device="cuda")
+                metric_values = torch.zeros((len(set_ids), len(metrics.values())), dtype=torch.float32, device=device)
 
             metric_values[set_id] += torch.stack([metrics[k] for k in metric_keys])
             metric_global_batch_size[set_id] += global_batch_size
@@ -395,6 +409,7 @@ def launch(hydra_config: DictConfig):
 
     # Load sync'ed config
     config = load_synced_config(hydra_config, rank=RANK, world_size=WORLD_SIZE)
+    print(config)
 
     # Seed RNGs to ensure consistency
     torch.random.manual_seed(config.seed + RANK)
@@ -405,8 +420,21 @@ def launch(hydra_config: DictConfig):
 
     assert config.epochs % train_epochs_per_iter == 0, "Eval interval must be a divisor of total epochs."
 
-    train_loader, train_metadata = create_dataloader(config, "train", test_set_mode=False, epochs_per_iter=train_epochs_per_iter, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
-    eval_loader,  eval_metadata  = create_dataloader(config, "test", test_set_mode=True, epochs_per_iter=1, global_batch_size=config.global_batch_size, rank=RANK, world_size=WORLD_SIZE)
+    train_loader, train_metadata = create_dataloader(config,
+                                                    "train",
+                                                    test_set_mode=False,
+                                                    epochs_per_iter=train_epochs_per_iter,
+                                                    global_batch_size=config.global_batch_size,
+                                                    rank=RANK,
+                                                    world_size=WORLD_SIZE)
+
+    eval_loader,  eval_metadata  = create_dataloader(config,
+                                                     "test",
+                                                     test_set_mode=True,
+                                                     epochs_per_iter=1,
+                                                     global_batch_size=config.global_batch_size,
+                                                     rank=RANK,
+                                                     world_size=WORLD_SIZE)
 
     # Train state
     train_state = init_train_state(config, train_metadata, world_size=WORLD_SIZE)
